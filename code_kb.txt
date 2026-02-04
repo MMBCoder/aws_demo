@@ -1,0 +1,332 @@
+/************************************************************************
+  SAS Program to:
+   - Load segmentation_requirements & campaign_requirements (pipe-delim)
+   - Pull account_dim, apply target criteria and suppressions
+   - Do Test/Control split per segmentation matrix for WFN=XXXXXX
+   - Create analysis dataset (all eligible + segment flag)
+   - Create WGRN_EM_seeds export dataset with required fields
+   - Write export file using code_kb filename logic
+  Notes:
+   - Files used (uploaded): segmentation_requirements.txt, campaign_requirements.txt, code_kb.txt
+     (these contain the segmentation and campaign rules and the file-write template). 
+   - Adjust libnames & account_dim variable names mapping as needed (see placeholders below).
+************************************************************************/
+
+/* ------------- MACROS & SETTINGS ------------- */
+%let target_wfn = XXXXXX;
+%let src_lib = src; /* change to the libname where account_dim lives (e.g. PROD or SRC) */
+%let out_path = /sasdata/exports/outbound/harmony; /* adjust as environment requires */
+
+/* ------------- Step 1: read the pipe-delimited requirements files ------------- */
+/* segmentation_requirements.txt and campaign_requirements.txt are pipe-delimited and have header rows */
+
+data segmentation_requirements;
+  infile "/mnt/data/Segmentation_requirements.txt" dsd dlm='|' firstobs=2 lrecl=32767 truncover;
+  length WFN $20 T_C_IND $1 Split $10 Channel $20 LANG_IND $5 COMM_CODE $50 CIS_MEMO $200;
+  input WFN $ T_C_IND $ Split $ Channel $ LANG_IND $ COMM_CODE $ CIS_MEMO $;
+run;
+
+data campaign_requirements;
+  infile "/mnt/data/campaign_requirements.txt" dsd dlm='|' firstobs=2 lrecl=32767 truncover;
+  length WFN $20 Client $50 Target_Criteria $200 Channel $10 EM_File_Layout $200 DM_File_Layout $200 Segment $50;
+  input WFN $ Client $ Target_Criteria $ Channel $ EM_File_Layout $ DM_File_Layout $ Segment $;
+run;
+
+/* ------------- Step 2: extract the segmentation rows for WFN=XXXXXX ------------- */
+proc sql noprint;
+  create table seg_XXXXXX as
+  select *
+  from segmentation_requirements
+  where strip(WFN) = "&target_wfn.";
+quit;
+
+/* For debugging, you can print seg_XXXXXX to verify it contains rows for EN and SP and the Split values */
+
+/* ------------- Step 3: get campaign-level layout & target criteria for this WFN ------------- */
+proc sql noprint;
+  select strip(Target_Criteria), strip(EM_File_Layout), strip(Client), strip(Channel)
+    into :WFN_Target_Criteria trimmed, :WFN_EM_Layout trimmed, :WFN_Client trimmed, :WFN_Channel trimmed
+  from campaign_requirements
+  where strip(WFN) = "&target_wfn.";
+quit;
+
+/* ------------- Step 4: Pull account_dim and apply target criteria & suppressions ------------- */
+/* NOTE: You must map the variable names below to your real account_dim column names.
+   I assume account_dim contains at least:
+     - prof_key (unique ID)
+     - email_address
+     - first_name
+     - last_name
+     - acct_nbr (or account_num)
+     - acct_open_flag (Y/N) or open_date
+     - email_marketing_elig_flag (Y/N)
+     - do_not_email / email_suppression_flag (Y/N)
+     - language_pref (EN/SP)
+     - last_purchase_date (or purchase_flag_last_6m)
+   If your columns are named differently, change the mappings in the SELECT below.
+*/
+
+libname &src_lib. "/sasdata/source"; /* adjust as required to point to source tables */
+
+/* Create base population from account_dim */
+data base_accounts;
+  set &src_lib..account_dim(
+    keep=prof_key email_address first_name last_name acct_nbr acct_open_flag 
+         email_marketing_flag do_not_email language_pref last_purchase_dt
+  );
+  /* Normalize */
+  prof_key = strip(prof_key);
+  email_address = lowcase(strip(email_address));
+  first_name = strip(first_name);
+  last_name = strip(last_name);
+  acct_nbr = strip(acct_nbr);
+  acct_open_flag = upcase(strip(acct_open_flag));
+  email_marketing_flag = upcase(strip(email_marketing_flag));
+  do_not_email = upcase(strip(do_not_email));
+  language_pref = upcase(strip(language_pref));
+  /* derive last_4 */
+  last_4_acct = substr(acct_nbr, length(acct_nbr)-3);
+run;
+
+/* Apply target criteria from campaign_requirements for WFN XXXXXX
+   For WFN XXXXXX campaign_requirements shows: "target the CHs with open account and Email eligible for marketing"
+   So we apply acct_open_flag='Y' and email_marketing_flag='Y'
+   Also apply classic suppressions: do_not_email='Y' or missing email_address or invalid address
+*/
+data eligible_pre_lang;
+  set base_accounts;
+  where acct_open_flag = 'Y'
+    and email_marketing_flag = 'Y'
+    and email_address ne ''
+    and do_not_email ne 'Y';
+  /* derive language code fallback: if language_pref blank, treat as EN */
+  if language_pref = '' then language_pref = 'EN';
+run;
+
+/* ------------- Step 5: apply language-specific segmentation and Test/Control split ------------- */
+/* We will use seg_XXXXXX rows. For WFN=XXXXXX we expect rows for EN and SP with T 90% EM and C 10% null channel. */
+/* Create an analysis dataset that flags each record with the appropriate language segmentation rows and then assign Test/Control randomly per split percentages */
+
+proc sql;
+  create table seg_params as
+  select LANG_IND, T_C_IND, compress(translate(Split,'%','')) as SplitNum, Channel, COMM_CODE
+  from seg_XXXXXX
+  order by LANG_IND, T_C_IND;
+quit;
+
+/* convert splits into numeric thresholds by language. We'll store the test percentage per language */
+proc sql noprint;
+  select LANG_IND, sum(input(compress(translate(Split,'%','')), best12.)) as total_pct
+  into :dummy
+  from seg_params
+  group by LANG_IND;
+quit;
+
+/* Create parameter dataset for language-level test percentage */
+proc sql noprint;
+  create table lang_test_pct as
+  select LANG_IND,
+         /* the T row has the Test %; find T where T_C_IND='T' */
+         input(compress((select Split from seg_XXXXXX s where s.LANG_IND=e.LANG_IND and s.T_C_IND='T' and strip(s.WFN)="&target_wfn." ),'%'), best12.) as test_pct format=8.2,
+         /* comm_code for T row */
+         (select COMM_CODE from seg_XXXXXX s where s.LANG_IND=e.LANG_IND and s.T_C_IND='T' and strip(s.WFN)="&target_wfn.") as comm_code
+  from (select distinct LANG_IND from seg_XXXXXX) e;
+quit;
+
+/* If the SQL above cannot reference the table inside select (some SAS versions), do it more verbosely: */
+proc sql;
+  create table lang_test_pct2 as
+  select a.LANG_IND,
+         input(compress(b.Split,'%'),best12.) as test_pct,
+         b.COMM_CODE
+  from (select distinct LANG_IND from seg_XXXXXX) a
+  left join seg_XXXXXX b
+    on a.LANG_IND = b.LANG_IND and b.T_C_IND = 'T' and strip(b.WFN)="&target_wfn.";
+quit;
+
+/* Keep lang_test_pct2 as the master language split table */
+data lang_test_pct_final;
+  set lang_test_pct2;
+  if test_pct = . then test_pct = 100; /* fallback: all test if missing */
+  pct_threshold = test_pct / 100;
+run;
+
+/* Merge eligible population with language split percentages */
+proc sql;
+  create table eligible_with_pct as
+  select e.*,
+         coalesce(l.test_pct,100) as test_pct,
+         coalesce(l.pct_threshold,1) as pct_threshold,
+         coalesce(l.COMM_CODE, '') as COMM_CODE
+  from eligible_pre_lang e
+  left join lang_test_pct_final l
+    on upcase(e.language_pref) = upcase(l.LANG_IND);
+quit;
+
+/* Now assign random number and segment based on pct_threshold.
+   Use a reproducible seed if required (change seed value).
+*/
+data analysis_population;
+  set eligible_with_pct;
+  call streaminit(12345); /* reproducible random */
+  rnd = rand("uniform");
+  /* If pct_threshold = 0.9 then rnd < 0.9 => Test else Control */
+  if rnd < pct_threshold then Segment = 'T'; else Segment = 'C';
+  /* for clarity map Segment to descriptive */
+  if Segment='T' then Segment_Label='TEST';
+  else Segment_Label='CONTROL';
+  /* keep fields needed */
+  keep prof_key email_address first_name last_name last_4_acct acct_nbr language_pref rnd Segment Segment_Label COMM_CODE test_pct;
+run;
+
+/* Create an analysis dataset that contains all eligible records (this meets "keep all the population in the analysis dataset") */
+data analysis_dataset_wfnXXXXXX;
+  set analysis_population;
+  /* attach WFN for traceability */
+  WFN = "&target_wfn.";
+run;
+
+/* ------------- Step 6: create the WGRN_EM_seeds dataset (only those to be exported via EM channel) ------------- */
+/* segmentation_requirements shows Channel=EM for T rows; control rows may have blank Channel.
+   We expect to export only EM channel records (Channel=EM). Use COMM_CODE from seg parameters.
+   If either language has EM channel, include those records assigned to Segment=T with Channel containing EM
+*/
+
+/* Determine which LANG_IND/Segment combinations map to Channel EM for this WFN */
+proc sql;
+  create table seg_channel_map as
+  select LANG_IND, T_C_IND, Channel, COMM_CODE
+  from seg_XXXXXX
+  where strip(WFN) = "&target_wfn.";
+quit;
+
+/* Build export dataset: include all records in analysis_dataset_wfnXXXXXX that should be in EM send
+   Rules applied:
+    - If Segment='T' and corresponding Channel contains 'EM' then include in export
+    - Use COMM_CODE from segmentation file for the matching LANG_IND and T_C_IND
+    - Fill MISC_01 = First_Name as specified in campaign_requirements for this WFN. (campaign_requirements EM layout: Misc_01 = First_Name). 
+*/
+
+proc sql;
+  create table WGRN_EM_seeds as
+  select a.prof_key as CustomerKey,
+         a.email_address as EmailAddress,
+         a.first_name as FIRST_NAME,
+         a.last_name as LAST_NAME,
+         a.last_4_acct as LAST_4_ACCT,
+         /* use a Campaign_Code value — we'll set it to a meaningful label (client + WFN) */
+         cats("&WFN_Client._", "&target_wfn.") as CAMPAIGN_CODE,
+         /* COMM_CODE from seg_channel_map where language matches and T_C_IND = Segment */
+         coalesce((select COMM_CODE from seg_channel_map s where upcase(s.LANG_IND)=upcase(a.language_pref) and s.T_C_IND = a.Segment), '') as comm_code,
+         /* MISC fields: from campaign_requirements EM File Layout we set MISC_01 = First_Name */
+         a.first_name as MISC_01,
+         /* leave other MISC fields blank for now */
+         '' as MISC_02,
+         '' as MISC_03,
+         '' as MISC_04,
+         '' as MISC_05,
+         '' as MISC_06,
+         '' as MISC_07,
+         '' as MISC_08,
+         '' as MISC_09,
+         '' as MISC_10,
+         '' as MISC_11,
+         '' as MISC_12
+  from analysis_dataset_wfnXXXXXX a
+  where /* include only EM-bound recipients:
+           check seg_channel_map for that language and segment has Channel containing 'EM' */
+    exists (select 1 from seg_channel_map s
+            where upcase(s.LANG_IND)=upcase(a.language_pref)
+              and s.T_C_IND = a.Segment
+              and index(upcase(s.Channel),"EM") > 0
+              and strip(s.WFN)="&target_wfn."
+           );
+quit;
+
+/* If you need a test file (as the user requested), create a test export dataset subset */
+/* We'll create a test file containing only a small sample (e.g., first 100 test records) - user asked "create an email file for test records" */
+/* The segmentation includes Test records; to produce a "test records file", select Segment='T' and limit or use all T as needed. */
+/* Here we create TEST_EXPORT with all Test members that are in the EM send. */
+data WGRN_EM_test_seeds;
+  set WGRN_EM_seeds;
+  where upcase(substr(CAMPAIGN_CODE,1,1)) ne ''; /* no-op - keep all; alter if need to limit */
+run;
+
+/* ------------- Step 7: create file name using code_kb logic and write pipe-delimited file ------------- */
+/* Reuse the pattern in code_kb.txt to create &file_name macro variable */
+%global file_name;
+%let EM_WF_Ref_Number = &target_wfn.;
+
+/* create timestamped filename similar to code_kb */
+%let file_name=%quote(RCAUTO.ATD_&EM_WF_Ref_Number._WAG_WelcomeSeries_EMOB.%sysfunc(date(),yymmddn8.)%sysfunc(compress(%sysfunc(time(), TOD9.),':')).TXT);
+%put file_name=&file_name.;
+
+/* write the main export file (all EM seeds) */
+data _null_;
+  set WGRN_EM_seeds end=last;
+  file "&out_path./&file_name." delimiter='|' DSD lrecl=32767 encoding="utf-8" DROPOVER;
+  if _n_ = 1 then put @1 "CustomerKey|EmailAddress|FIRST_NAME|LAST_NAME|LAST_4_ACCT|CAMPAIGN_CODE|COMM_CODE|MISC_01|MISC_02|MISC_03|MISC_04|MISC_05|MISC_06|MISC_07|MISC_08|MISC_09|MISC_10|MISC_11|MISC_12";
+  put CustomerKey $
+      EmailAddress $
+      FIRST_NAME $
+      LAST_NAME $
+      LAST_4_ACCT $
+      CAMPAIGN_CODE $
+      comm_code $
+      MISC_01 $
+      MISC_02 $
+      MISC_03 $
+      MISC_04 $
+      MISC_05 $
+      MISC_06 $
+      MISC_07 $
+      MISC_08 $
+      MISC_09 $
+      MISC_10 $
+      MISC_11 $
+      MISC_12 $;
+run;
+
+/* Write a separate test file (if you want a separate test export). Create a filename suffix TEST */
+%let test_file_name = %sysfunc(tranwrd(&file_name.,.TXT,_TEST.TXT));
+data _null_;
+  set WGRN_EM_test_seeds end=last;
+  file "&out_path./&test_file_name." delimiter='|' DSD lrecl=32767 encoding="utf-8" DROPOVER;
+  if _n_ = 1 then put @1 "CustomerKey|EmailAddress|FIRST_NAME|LAST_NAME|LAST_4_ACCT|CAMPAIGN_CODE|COMM_CODE|MISC_01|MISC_02|MISC_03|MISC_04|MISC_05|MISC_06|MISC_07|MISC_08|MISC_09|MISC_10|MISC_11|MISC_12";
+  put CustomerKey $
+      EmailAddress $
+      FIRST_NAME $
+      LAST_NAME $
+      LAST_4_ACCT $
+      CAMPAIGN_CODE $
+      comm_code $
+      MISC_01 $
+      MISC_02 $
+      MISC_03 $
+      MISC_04 $
+      MISC_05 $
+      MISC_06 $
+      MISC_07 $
+      MISC_08 $
+      MISC_09 $
+      MISC_10 $
+      MISC_11 $
+      MISC_12 $;
+run;
+
+/* ------------- Step 8: Produce summary reports (counts by language/segment) ------------- */
+proc freq data=analysis_dataset_wfnXXXXXX;
+  tables language_pref*Segment / norow nocol nopercent;
+run;
+
+proc sql;
+  create table export_counts as
+  select language_pref, Segment_Label, count(*) as n from analysis_dataset_wfnXXXXXX group by language_pref, Segment_Label;
+quit;
+
+/* Save datasets for auditing */
+proc datasets lib=work nolist;
+  save analysis_dataset_wfnXXXXXX WGRN_EM_seeds WGRN_EM_test_seeds export_counts;
+quit;
+
+/* End of program */

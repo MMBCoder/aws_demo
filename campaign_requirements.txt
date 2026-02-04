@@ -1,0 +1,4 @@
+WFN|Client|Target_Criteria|Channel|EM File Layout|DM File layout|Segment
+456789|LOES|target the CHs with open account and Email eligible for marketing |EM|Misc_01 = First_Name||Test and Control
+123456|ALSH|target the CHs with open account,purchase active in last 6 months and Email eligible for marketing |EM|Misc_01 = First_Name||Test and Control
+345678|QVT|target the CHs with open account and Email and DM eligible for marketing |DE|Misc_01 = First_Name|Standard layout|Test
